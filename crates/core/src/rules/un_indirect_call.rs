@@ -1,6 +1,10 @@
 use swc_core::common::util::take::Take;
+use swc_core::common::Mark;
+use swc_core::ecma::ast::{
+    AssignExpr, AssignTarget, ForInStmt, ForOfStmt, UnaryExpr, UnaryOp, UpdateExpr,
+};
 use swc_core::ecma::ast::{CallExpr, Callee, Expr, Ident, Lit, SeqExpr, WithStmt};
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::RewriteLevel;
 
@@ -9,6 +13,8 @@ use crate::utils::paren::strip_parens;
 pub struct UnIndirectCall {
     level: RewriteLevel,
     with_depth: usize,
+    unresolved_mark: Mark,
+    object_write: bool,
 }
 
 impl UnIndirectCall {
@@ -16,6 +22,26 @@ impl UnIndirectCall {
         Self {
             level,
             with_depth: 0,
+            unresolved_mark: Mark::root(),
+            object_write: false,
+        }
+    }
+
+    pub fn new_with_mark(
+        level: RewriteLevel,
+        unresolved_mark: Mark,
+        module: &swc_core::ecma::ast::Module,
+    ) -> Self {
+        let mut writes = ObjectWriteCollector {
+            unresolved_mark,
+            writes: false,
+        };
+        module.visit_with(&mut writes);
+        Self {
+            level,
+            with_depth: 0,
+            unresolved_mark,
+            object_write: writes.writes,
         }
     }
 }
@@ -79,8 +105,10 @@ impl VisitMut for UnIndirectCall {
 
         // Pattern 2: Object(fn.method)(args) → fn.method(args)
         // Object() called on a function just returns it — used as indirect call
-        if self.level >= RewriteLevel::Standard {
-            if let Some(inner) = as_object_wrap_call(callee_expr, self.with_depth) {
+        if self.level >= RewriteLevel::Standard && !self.object_write {
+            if let Some(inner) =
+                as_object_wrap_call(callee_expr, self.with_depth, self.unresolved_mark)
+            {
                 *expr = Expr::Call(CallExpr {
                     span: *span,
                     ctxt: *ctxt,
@@ -94,7 +122,7 @@ impl VisitMut for UnIndirectCall {
 }
 
 /// If `expr` is `Object(inner)` where inner is a member or ident expr, return `inner`.
-fn as_object_wrap_call(expr: &Expr, with_depth: usize) -> Option<Box<Expr>> {
+fn as_object_wrap_call(expr: &Expr, with_depth: usize, unresolved_mark: Mark) -> Option<Box<Expr>> {
     let Expr::Call(call) = strip_parens(expr) else {
         return None;
     };
@@ -105,10 +133,10 @@ fn as_object_wrap_call(expr: &Expr, with_depth: usize) -> Option<Box<Expr>> {
         return None;
     };
     // Must be exactly `Object`
-    let Expr::Ident(Ident { sym, .. }) = strip_parens(callee_expr) else {
+    let Expr::Ident(Ident { sym, ctxt, .. }) = strip_parens(callee_expr) else {
         return None;
     };
-    if sym.as_str() != "Object" {
+    if sym.as_str() != "Object" || ctxt.outer() != unresolved_mark {
         return None;
     }
     let arg = call.args.first()?;
@@ -116,6 +144,65 @@ fn as_object_wrap_call(expr: &Expr, with_depth: usize) -> Option<Box<Expr>> {
         return None;
     }
     as_member_or_safe_ident(&arg.expr, with_depth)
+}
+
+struct ObjectWriteCollector {
+    unresolved_mark: Mark,
+    writes: bool,
+}
+
+impl ObjectWriteCollector {
+    fn is_global_object(&self, expr: &Expr) -> bool {
+        matches!(strip_parens(expr), Expr::Ident(id) if id.sym.as_str() == "Object" && id.ctxt.outer() == self.unresolved_mark)
+    }
+}
+
+impl Visit for ObjectWriteCollector {
+    fn visit_assign_expr(&mut self, expr: &AssignExpr) {
+        if let AssignTarget::Simple(swc_core::ecma::ast::SimpleAssignTarget::Ident(id)) = &expr.left
+        {
+            if id.sym.as_str() == "Object" && id.ctxt.outer() == self.unresolved_mark {
+                self.writes = true;
+            }
+        }
+        expr.visit_children_with(self);
+    }
+
+    fn visit_update_expr(&mut self, expr: &UpdateExpr) {
+        if self.is_global_object(&expr.arg) {
+            self.writes = true;
+        }
+        expr.visit_children_with(self);
+    }
+
+    fn visit_unary_expr(&mut self, expr: &UnaryExpr) {
+        if expr.op == UnaryOp::Delete && self.is_global_object(&expr.arg) {
+            self.writes = true;
+        }
+        expr.visit_children_with(self);
+    }
+
+    fn visit_for_in_stmt(&mut self, stmt: &ForInStmt) {
+        if let swc_core::ecma::ast::ForHead::Pat(pat) = &stmt.left {
+            if let swc_core::ecma::ast::Pat::Ident(id) = pat.as_ref() {
+                if id.id.sym.as_str() == "Object" && id.id.ctxt.outer() == self.unresolved_mark {
+                    self.writes = true;
+                }
+            }
+        }
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_for_of_stmt(&mut self, stmt: &ForOfStmt) {
+        if let swc_core::ecma::ast::ForHead::Pat(pat) = &stmt.left {
+            if let swc_core::ecma::ast::Pat::Ident(id) = pat.as_ref() {
+                if id.id.sym.as_str() == "Object" && id.id.ctxt.outer() == self.unresolved_mark {
+                    self.writes = true;
+                }
+            }
+        }
+        stmt.visit_children_with(self);
+    }
 }
 
 fn as_seq_expr(expr: &Expr) -> Option<&SeqExpr> {

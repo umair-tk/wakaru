@@ -183,9 +183,13 @@ fn run_remove_void(module: &mut Module, ctx: RuleRunContext<'_>) {
 runner!(run_unminify_booleans, UnminifyBooleans);
 runner!(run_un_double_negation, UnDoubleNegation);
 runner!(run_un_infinity, UnInfinity);
-runner!(run_un_indirect_call, |ctx| UnIndirectCall::new(
-    ctx.rewrite_level
-));
+fn run_un_indirect_call(module: &mut Module, ctx: RuleRunContext<'_>) {
+    module.visit_mut_with(&mut UnIndirectCall::new_with_mark(
+        ctx.rewrite_level,
+        ctx.unresolved_mark,
+        module,
+    ));
+}
 runner!(run_un_typeof, UnTypeof);
 runner!(run_un_numeric_literal, UnNumericLiteral);
 runner!(run_un_bracket_notation, UnBracketNotation);
