@@ -44,6 +44,7 @@ impl SmartRename {
 
 impl VisitMut for SmartRename {
     fn visit_mut_module(&mut self, module: &mut Module) {
+        rename_promise_then_callbacks(module, self.unresolved_mark);
         let previous_pending_names = std::mem::replace(
             &mut self.pending_value_position_names,
             collect_value_position_rename_map_module(module),
@@ -89,6 +90,131 @@ impl VisitMut for SmartRename {
         member_init_rename_arrow(arrow);
         symbol_for_rename_arrow(arrow, self.unresolved_mark);
         arrow.visit_mut_children_with(self);
+    }
+}
+
+/// Give the two callbacks of the global Promise.then helper names that expose
+/// their completion role. This is deliberately kept separate from the other
+/// smart-renaming collectors: the callback positions are part of the API of
+/// Promise.then, while an arbitrary object's `then` method has no such
+/// contract.
+fn rename_promise_then_callbacks(module: &mut Module, unresolved_mark: Mark) {
+    let mut renamer = PromiseThenRenamer { unresolved_mark };
+    module.visit_mut_with(&mut renamer);
+}
+
+struct PromiseThenRenamer {
+    unresolved_mark: Mark,
+}
+
+impl PromiseThenRenamer {
+    fn callback_role(index: usize) -> Option<&'static str> {
+        match index {
+            0 => Some("value"),
+            1 => Some("error"),
+            _ => None,
+        }
+    }
+
+    fn callback_binding(expr: &Expr) -> Option<BindingId> {
+        match expr {
+            Expr::Arrow(arrow) => arrow.params.first().and_then(|param| match param {
+                Pat::Ident(binding) => Some((binding.id.sym.clone(), binding.id.ctxt)),
+                _ => None,
+            }),
+            Expr::Fn(function) => {
+                function
+                    .function
+                    .params
+                    .first()
+                    .and_then(|param| match &param.pat {
+                        Pat::Ident(binding) => Some((binding.id.sym.clone(), binding.id.ctxt)),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn names_inside(expr: &Expr) -> HashSet<Atom> {
+        let mut collector = CallbackNameCollector::default();
+        expr.visit_with(&mut collector);
+        collector.names
+    }
+
+    fn rename_callback(&mut self, expr: &mut Expr, role: &str) {
+        let Some(binding) = Self::callback_binding(expr) else {
+            return;
+        };
+        let old = binding.0.clone();
+        let target: Atom = role.into();
+        if old == target || Self::names_inside(expr).contains(&target) {
+            return;
+        }
+        let rename = [BindingRename {
+            old: binding,
+            new: target,
+        }];
+        match expr {
+            Expr::Arrow(arrow) => {
+                rename_bindings(&mut arrow.params, &rename);
+                rename_bindings(&mut arrow.body, &rename);
+            }
+            Expr::Fn(function) => {
+                rename_bindings(&mut function.function.params, &rename);
+                if let Some(body) = &mut function.function.body {
+                    rename_bindings(body, &rename);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Default)]
+struct CallbackNameCollector {
+    names: HashSet<Atom>,
+}
+
+impl Visit for CallbackNameCollector {
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.names.insert(ident.sym.clone());
+    }
+}
+
+impl VisitMut for PromiseThenRenamer {
+    fn visit_mut_call_expr(&mut self, call: &mut CallExpr) {
+        let is_promise_then = match &call.callee {
+            Callee::Expr(callee) => match callee.as_ref() {
+                Expr::Member(MemberExpr {
+                    obj,
+                    prop: MemberProp::Ident(prop),
+                    ..
+                }) => matches!(obj.as_ref(), Expr::Ident(id)
+                    if prop.sym == "then"
+                        && is_unresolved_ident(id, "Promise", self.unresolved_mark)),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !is_promise_then {
+            call.visit_mut_children_with(self);
+            return;
+        }
+
+        call.callee.visit_mut_with(self);
+        for (index, arg) in call.args.iter_mut().enumerate() {
+            let Some(role) = Self::callback_role(index) else {
+                arg.visit_mut_with(self);
+                continue;
+            };
+            if arg.spread.is_some() {
+                arg.visit_mut_with(self);
+                continue;
+            }
+            self.rename_callback(&mut arg.expr, role);
+            arg.expr.visit_mut_with(self);
+        }
     }
 }
 
