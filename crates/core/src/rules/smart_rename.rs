@@ -5,11 +5,12 @@ use std::rc::Rc;
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
-    ArrayPat, ArrowExpr, ArrowFunctionBody, AssignPatProp, CallExpr, Callee, ClassDecl, ClassExpr,
-    Decl, Expr, FnDecl, FnExpr, Function, GetterProp, Ident, ImportDecl, ImportSpecifier, JSXAttr,
-    JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElementName, JSXExpr, JSXExprContainer,
-    JSXMemberExpr, JSXObject, KeyValuePatProp, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
-    ModuleItem, ObjectPat, ObjectPatProp, Param, Pat, Prop, PropName, Stmt, VarDecl, VarDeclKind,
+    ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignPatProp, CallExpr, Callee, ClassDecl,
+    ClassExpr, Decl, Expr, FnDecl, FnExpr, Function, GetterProp, Ident, ImportDecl,
+    ImportSpecifier, JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElementName, JSXExpr,
+    JSXExprContainer, JSXMemberExpr, JSXObject, KeyValuePatProp, Lit, MemberExpr, MemberProp,
+    Module, ModuleDecl, ModuleItem, ObjectPat, ObjectPatProp, Param, Pat, Prop, PropName, Stmt,
+    UnaryExpr, UnaryOp, UpdateExpr, VarDecl, VarDeclKind,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -99,8 +100,64 @@ impl VisitMut for SmartRename {
 /// Promise.then, while an arbitrary object's `then` method has no such
 /// contract.
 fn rename_promise_then_callbacks(module: &mut Module, unresolved_mark: Mark) {
+    let mut mutation_checker = PromiseMutationChecker {
+        unresolved_mark,
+        mutated: false,
+        write_target_depth: 0,
+    };
+    module.visit_with(&mut mutation_checker);
+    if mutation_checker.mutated {
+        return;
+    }
     let mut renamer = PromiseThenRenamer { unresolved_mark };
     module.visit_mut_with(&mut renamer);
+}
+
+/// Promise is an unresolved global only while the module leaves that binding
+/// untouched. A write can occur before or after a callback, so this check is
+/// intentionally module-wide rather than position-sensitive.
+struct PromiseMutationChecker {
+    unresolved_mark: Mark,
+    mutated: bool,
+    write_target_depth: usize,
+}
+
+impl PromiseMutationChecker {
+    fn is_promise(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Ident(id)
+            if is_unresolved_ident(id, "Promise", self.unresolved_mark))
+    }
+}
+
+impl Visit for PromiseMutationChecker {
+    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+        self.write_target_depth += 1;
+        assignment.left.visit_with(self);
+        self.write_target_depth -= 1;
+        assignment.right.visit_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &UpdateExpr) {
+        self.write_target_depth += 1;
+        update.arg.visit_with(self);
+        self.write_target_depth -= 1;
+    }
+
+    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        if unary.op == UnaryOp::Delete {
+            self.write_target_depth += 1;
+            unary.arg.visit_with(self);
+            self.write_target_depth -= 1;
+        } else {
+            unary.visit_children_with(self);
+        }
+    }
+
+    fn visit_ident(&mut self, ident: &Ident) {
+        if self.write_target_depth > 0 && self.is_promise(&Expr::Ident(ident.clone())) {
+            self.mutated = true;
+        }
+    }
 }
 
 struct PromiseThenRenamer {
